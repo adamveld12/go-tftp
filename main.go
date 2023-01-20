@@ -26,6 +26,61 @@ var (
 	sv          server
 )
 
+func main() {
+	flag.Parse()
+
+	lc := net.ListenConfig{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	address := fmt.Sprintf("%s:%d", *BindAddress, *Port)
+	l, err := lc.ListenPacket(ctx, "udp", address)
+	if err != nil {
+		log.Fatalf("could not listen on %s: %+v", address, err)
+	}
+	defer l.Close()
+
+	log.Printf("Listening @ %s", address)
+	log.Printf("Serving files in %s", *Directory)
+
+	go func() {
+		sv = server{
+			sessions: map[string]*session{},
+			Mutex:    &sync.Mutex{},
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				var (
+					read int
+					addr net.Addr
+					err  error
+					dp   = make(DataPacket, 516)
+				)
+
+				if read, addr, err = l.ReadFrom(dp[:]); err != nil || read == 0 {
+					continue
+				}
+
+				if *Log {
+					log.Printf("[%q -> server]: read %d bytes", addr.String(), read)
+				}
+
+				sv.GetSession(ctx, addr, l) <- dp
+			}
+		}
+	}()
+
+	sigs := make(chan os.Signal, 5)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	<-sigs
+	log.Println("Shutting down...")
+}
+
 const (
 	Opcode_RRQ   = Opcode(iota + 1)
 	Opcode_WRQ   = Opcode(iota + 1)
@@ -97,30 +152,30 @@ type server struct {
 	*sync.Mutex
 }
 
-func (s *server) Get(addr net.Addr, l net.PacketConn) (*session, bool) {
+func (s *server) GetSession(ctx context.Context, addr net.Addr, l net.PacketConn) chan<- DataPacket {
 	s.Lock()
 	defer s.Unlock()
 	key := addr.String()
 	sess, ok := s.sessions[key]
-
 	if !ok {
-		ctx, canceler := context.WithCancel(context.Background())
+		ctx, canceller := context.WithCancel(ctx)
+
 		s.sessions[key] = &session{
 			addr: addr,
-			ctx:  ctx,
 			w: func(dp DataPacket) {
 				if _, err := l.WriteTo(dp, addr); err != nil {
 					s.Close(key)
 				}
 			},
-			msg: make(chan DataPacket),
+			msg: make(chan DataPacket, 5),
 		}
 
-		go s.sessions[key].Run(canceler)
+		go s.sessions[key].Run(ctx, canceller)
+
 		sess = s.sessions[key]
 	}
 
-	return sess, ok
+	return sess.msg
 }
 
 func (s *server) Close(key string) {
@@ -137,17 +192,18 @@ type (
 	PacketWriter func(DataPacket)
 	session      struct {
 		addr net.Addr
-		ctx  context.Context
 		w    PacketWriter
 		msg  chan DataPacket
 	}
 )
 
-func (s *session) Run(canceller context.CancelFunc) {
+func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 	tout := time.NewTimer(*Timeout)
 	defer sv.Close(s.addr.String())
 	defer canceller()
 	defer tout.Stop()
+
+	s.log("client session started")
 
 	var initOpcode Opcode
 	var sourceFile *os.File
@@ -156,10 +212,14 @@ func (s *session) Run(canceller context.CancelFunc) {
 	for {
 		tout.Reset(*Timeout)
 		select {
+		case <-ctx.Done():
+			return
 		case <-tout.C:
 			s.log("timed out")
 			return
 		case dp := <-s.msg:
+			// if this is the first opcode of the session, it should be a read/write op
+			// we start by opening a file, either to create or read
 			if initOpcode == 0 && dp.Opcode() == Opcode_RRQ || dp.Opcode() == Opcode_WRQ {
 				initOpcode = dp.Opcode()
 				_, file, mode := dp.ParseRRQ()
@@ -187,7 +247,7 @@ func (s *session) Run(canceller context.CancelFunc) {
 			}
 
 			// doing file transfer to client
-			if initOpcode == Opcode_RRQ {
+			if initOpcode == Opcode_RRQ && sourceFile != nil {
 				if dp.Opcode() == Opcode_ACK {
 					_, blockID := dp.ParseAck()
 
@@ -223,8 +283,11 @@ func (s *session) Run(canceller context.CancelFunc) {
 					transferFinished = true
 					continue
 				}
-			} else if initOpcode == Opcode_WRQ {
+			} else if initOpcode == Opcode_WRQ && sourceFile != nil {
 				// Writing is not supported
+				s.w(NewErrorPacket(ErrorCode_NotDefined))
+				return
+			} else {
 				s.w(NewErrorPacket(ErrorCode_NotDefined))
 				return
 			}
@@ -247,71 +310,6 @@ func (s *session) log(msg string, args ...interface{}) {
 	if *Log {
 		log.Printf("[%s]: %s", s.addr, fmt.Sprintf(msg, args...))
 	}
-}
-
-func main() {
-	flag.Parse()
-	address := fmt.Sprintf("%s:%d", *BindAddress, *Port)
-	l, err := net.ListenPacket("udp", address)
-	if err != nil {
-		log.Fatalf("could not listen on %s: %+v", address, err)
-	}
-	defer l.Close()
-
-	log.Printf("Listening @ %s", address)
-	log.Printf("Serving files in %s", *Directory)
-
-	sv = server{
-		sessions: map[string]*session{},
-		Mutex:    &sync.Mutex{},
-	}
-
-	sigs := make(chan os.Signal, 5)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-
-	ctx, canceler := context.WithCancel(context.Background())
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-
-				if err := l.SetReadDeadline(time.Now().Add(time.Second * 5)); err != nil {
-					log.Panic("could not SetReadDeadline on listener:", err)
-				}
-
-				var (
-					read int
-					addr net.Addr
-					err  error
-					dp   = make(DataPacket, 516)
-				)
-
-				if read, addr, err = l.ReadFrom(dp[:]); err != nil || read == 0 {
-					continue
-				}
-
-				if *Log {
-					log.Printf("[%q -> server]: read %d bytes", addr.String(), read)
-				}
-
-				clientSession, ok := sv.Get(addr, l)
-				if !ok {
-					clientSession.log("creating new client session")
-				}
-
-				select {
-				case clientSession.msg <- dp:
-				}
-			}
-		}
-	}()
-
-	<-sigs
-	canceler()
-	log.Println("Shutting down...")
 }
 
 type DataPacket []byte

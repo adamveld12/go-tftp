@@ -17,10 +17,13 @@ Open main.go and hit F5 in vscode :sunglasses:
 
 ```sh
 # build it
-docker build -t tftp-server .
+make build # docker build -t tftp-server .
 
 # run it
-docker run -p 6969:69 -v /tmp/tftp-server:/var/tftp-data tftp-server
+make docker_run # docker run -p 6969:69 -v $PWD/files:/var/tftp-data tftp-server
+
+# test it
+make test # tftp 127.0.0.1 6969 -c get hello.txt
 ```
 
 ## License
