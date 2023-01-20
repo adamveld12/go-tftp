@@ -127,7 +127,7 @@ func (s *server) Close(key string) {
 	s.Lock()
 	defer s.Unlock()
 	if session, ok := s.sessions[key]; ok {
-		session.log("Closing %s", key)
+		session.log("Closing session")
 		delete(s.sessions, key)
 		defer close(session.msg)
 	}
@@ -164,13 +164,16 @@ func (s *session) Run(canceller context.CancelFunc) {
 				initOpcode = dp.Opcode()
 				_, file, mode := dp.ParseRRQ()
 				s.log("op: %s | file: %s | mode: %s", dp.Opcode(), file, mode)
-				f, err := os.Open(filepath.Join(*Directory, file))
+				fp := filepath.Join(*Directory, file)
+				f, err := os.Open(fp)
 				if err != nil {
 					if errors.Is(err, os.ErrNotExist) {
+						s.log("File not found: %q", fp)
 						s.w(NewErrorPacket(ErrorCode_FileNotFound))
 						return
 					}
 					if errors.Is(err, os.ErrPermission) {
+						s.log("Permission to read file denied: %q", fp)
 						s.w(NewErrorPacket(ErrorCode_AccessViolation))
 						return
 					}
@@ -191,10 +194,10 @@ func (s *session) Run(canceller context.CancelFunc) {
 					// TODO: will on retry sending the last block sent
 					blockPtr := uint16(blockSent % 65535)
 					if blockID == blockPtr {
-						s.log("ACKed: %d", blockID)
+						s.log("ACKed block %d", blockID)
 						blockSent++
 					} else if blockID > blockPtr {
-						s.log("Acked a block that we didnt send")
+						s.log("ACKed a block that we didnt send")
 						s.w(NewErrorPacket(ErrorCode_AccessViolation))
 						return
 					} else {
@@ -274,30 +277,31 @@ func main() {
 			case <-ctx.Done():
 				return
 			default:
-				l.SetReadDeadline(time.Now().Add(time.Second * 2))
 
-				dp := make(DataPacket, 516)
+				if err := l.SetReadDeadline(time.Now().Add(time.Second * 5)); err != nil {
+					log.Panic("could not SetReadDeadline on listener:", err)
+				}
 
-				read, addr, err := l.ReadFrom(dp[:])
-				if err != nil {
-					if *Log {
-						log.Printf("could not read: %q", err)
-					}
+				var (
+					read int
+					addr net.Addr
+					err  error
+					dp   = make(DataPacket, 516)
+				)
+
+				if read, addr, err = l.ReadFrom(dp[:]); err != nil || read == 0 {
 					continue
 				}
 
 				if *Log {
-					log.Printf("[%q -> server]: read %d", addr.String(), read)
-				}
-
-				if read == 0 {
-					continue
+					log.Printf("[%q -> server]: read %d bytes", addr.String(), read)
 				}
 
 				clientSession, ok := sv.Get(addr, l)
 				if ok {
-					clientSession.log("handling new conn")
+					clientSession.log("creating new client session")
 				}
+
 				select {
 				case clientSession.msg <- dp:
 				}
@@ -372,10 +376,4 @@ func (dp DataPacket) ParseAck() (oc Opcode, block uint16) {
 
 func (dp DataPacket) Data() []byte {
 	return dp[4:512]
-}
-
-func writeLog(addr net.Addr, msg string, args ...interface{}) {
-	if *Log {
-		log.Printf(fmt.Sprintf("%v: %s", msg, addr.String()), args...)
-	}
 }

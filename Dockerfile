@@ -19,4 +19,4 @@ EXPOSE 69/udp
 VOLUME /var/tftp-data
 
 ENTRYPOINT ["/bin/tftp-server"]
-CMD ["-directory=/var/tftp-data", "-port=69", "-address=0.0.0.0", "-verbose"]
+CMD ["-directory=/var/tftp-data", "-port=69", "-address=", "-verbose"]
