@@ -20,7 +20,7 @@ import (
 var (
 	Directory   = flag.String("directory", "", "directory to serve from")
 	BindAddress = flag.String("address", "127.0.0.1", "address to bind to")
-	Timeout     = flag.Duration("timeout", time.Second*5, "time until disconnect for session")
+	Timeout     = flag.Duration("timeout", time.Second*15, "time until disconnect for session")
 	Port        = flag.Int("port", 69, "port to listen on")
 	Log         = flag.Bool("verbose", false, "verbose logging")
 )
@@ -220,6 +220,8 @@ func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 			s.trace("timed out")
 			return
 		case dp := <-s.msg:
+			s.trace("opcode: %s", dp.Opcode())
+
 			// if this is the first opcode of the session, it should be a read/write op
 			// we start by opening a file, either to create or read
 			if initOpcode == 0 && dp.Opcode() == Opcode_RRQ || dp.Opcode() == Opcode_WRQ {
