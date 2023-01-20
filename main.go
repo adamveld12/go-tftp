@@ -23,7 +23,6 @@ var (
 	Timeout     = flag.Duration("timeout", time.Second*5, "time until disconnect for session")
 	Port        = flag.Int("port", 69, "port to listen on")
 	Log         = flag.Bool("verbose", false, "verbose logging")
-	sv          server
 )
 
 func main() {
@@ -45,7 +44,7 @@ func main() {
 	log.Printf("Serving files in %s", *Directory)
 
 	go func() {
-		sv = server{
+		sv := server{
 			sessions: map[string]*session{},
 			Mutex:    &sync.Mutex{},
 		}
@@ -64,10 +63,6 @@ func main() {
 
 				if read, addr, err = l.ReadFrom(dp[:]); err != nil || read == 0 {
 					continue
-				}
-
-				if *Log {
-					log.Printf("[%q -> server]: read %d bytes", addr.String(), read)
 				}
 
 				sv.GetSession(ctx, addr, l) <- dp
@@ -170,7 +165,10 @@ func (s *server) GetSession(ctx context.Context, addr net.Addr, l net.PacketConn
 			msg: make(chan DataPacket, 5),
 		}
 
-		go s.sessions[key].Run(ctx, canceller)
+		go s.sessions[key].Run(ctx, func() {
+			canceller()
+			s.Close(key)
+		})
 
 		sess = s.sessions[key]
 	}
@@ -182,7 +180,7 @@ func (s *server) Close(key string) {
 	s.Lock()
 	defer s.Unlock()
 	if session, ok := s.sessions[key]; ok {
-		session.log("Closing session")
+		session.trace("Closing session")
 		delete(s.sessions, key)
 		defer close(session.msg)
 	}
@@ -199,23 +197,27 @@ type (
 
 func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 	tout := time.NewTimer(*Timeout)
-	defer sv.Close(s.addr.String())
 	defer canceller()
 	defer tout.Stop()
 
-	s.log("client session started")
+	s.trace("session started")
 
-	var initOpcode Opcode
-	var sourceFile *os.File
-	var blockSent uint64 = 1
-	var transferFinished bool
+	var (
+		sourceFile       *os.File
+		initOpcode       Opcode
+		started                 = time.Now()
+		blockSent        uint64 = 1
+		bytesSent        uint64
+		transferFinished bool
+	)
+
 	for {
 		tout.Reset(*Timeout)
 		select {
 		case <-ctx.Done():
 			return
 		case <-tout.C:
-			s.log("timed out")
+			s.trace("timed out")
 			return
 		case dp := <-s.msg:
 			// if this is the first opcode of the session, it should be a read/write op
@@ -223,17 +225,17 @@ func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 			if initOpcode == 0 && dp.Opcode() == Opcode_RRQ || dp.Opcode() == Opcode_WRQ {
 				initOpcode = dp.Opcode()
 				_, file, mode := dp.ParseRRQ()
-				s.log("op: %s | file: %s | mode: %s", dp.Opcode(), file, mode)
+				s.trace("op: %s | file: %s | mode: %s", dp.Opcode(), file, mode)
 				fp := filepath.Join(*Directory, file)
 				f, err := os.Open(fp)
 				if err != nil {
 					if errors.Is(err, os.ErrNotExist) {
-						s.log("File not found: %q", fp)
+						s.log("file not found: %q", fp)
 						s.w(NewErrorPacket(ErrorCode_FileNotFound))
 						return
 					}
 					if errors.Is(err, os.ErrPermission) {
-						s.log("Permission to read file denied: %q", fp)
+						s.log("permission to read file denied: %q", fp)
 						s.w(NewErrorPacket(ErrorCode_AccessViolation))
 						return
 					}
@@ -250,14 +252,13 @@ func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 			if initOpcode == Opcode_RRQ && sourceFile != nil {
 				if dp.Opcode() == Opcode_ACK {
 					_, blockID := dp.ParseAck()
-
-					// TODO: will on retry sending the last block sent
 					blockPtr := uint16(blockSent % 65535)
+
 					if blockID == blockPtr {
-						s.log("ACKed block %d", blockID)
+						s.trace("ACKed block %d", blockID)
 						blockSent++
 					} else if blockID > blockPtr {
-						s.log("ACKed a block that we didnt send")
+						s.trace("ACKed a block that we didnt send")
 						s.w(NewErrorPacket(ErrorCode_AccessViolation))
 						return
 					} else {
@@ -265,7 +266,7 @@ func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 					}
 
 					if transferFinished {
-						s.log("transfer completed successfully")
+						s.log("%q completed. %d bytes took %v", sourceFile.Name(), bytesSent, time.Since(started)/time.Second)
 						return
 					}
 				}
@@ -276,7 +277,8 @@ func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 					return
 				}
 
-				s.log("sending block %d - %d bytes", blockSent, len(data))
+				s.trace("sending block %d - %d bytes", blockSent, len(data))
+				bytesSent += uint64(len(data))
 				s.w(NewDataPacket(uint16(blockSent%65535), data))
 
 				if len(data) < 512 {
@@ -307,8 +309,12 @@ func readPacket(f io.ReadSeeker, block uint64) ([]byte, error) {
 }
 
 func (s *session) log(msg string, args ...interface{}) {
+	log.Printf("INFO [%s]: %s", s.addr, fmt.Sprintf(msg, args...))
+}
+
+func (s *session) trace(msg string, args ...interface{}) {
 	if *Log {
-		log.Printf("[%s]: %s", s.addr, fmt.Sprintf(msg, args...))
+		log.Printf("TRACE [%s]: %s", s.addr, fmt.Sprintf(msg, args...))
 	}
 }
 
