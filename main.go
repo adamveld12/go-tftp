@@ -298,7 +298,7 @@ func main() {
 				}
 
 				clientSession, ok := sv.Get(addr, l)
-				if ok {
+				if !ok {
 					clientSession.log("creating new client session")
 				}
 
