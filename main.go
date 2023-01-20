@@ -221,6 +221,11 @@ func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 			return
 		case dp := <-s.msg:
 			s.trace("opcode: %s", dp.Opcode())
+			if dp.Opcode() == Opcode_ERROR {
+				_, errCode, errMsg := dp.ParseError()
+				s.log("error from client: (%d) %q", errCode, errMsg)
+				return
+			}
 
 			// if this is the first opcode of the session, it should be a read/write op
 			// we start by opening a file, either to create or read
@@ -360,6 +365,14 @@ func NewErrorPacket(ec ErrorCode) DataPacket {
 
 func (dp DataPacket) Opcode() Opcode {
 	return Opcode(uint16(dp[0])<<8 | uint16(dp[1]))
+}
+
+func (dp DataPacket) ParseError() (oc Opcode, errCode ErrorCode, errMsg string) {
+	oc = Opcode(uint16(dp[0])<<8 | uint16(dp[1]))
+	errCode = ErrorCode(uint16(dp[2])<<8 | uint16(dp[3]))
+	errMsg = string(dp[4:])
+
+	return
 }
 
 func (dp DataPacket) ParseRRQ() (oc Opcode, file, mode string) {
