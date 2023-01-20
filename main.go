@@ -226,6 +226,7 @@ func (s *session) Run(ctx context.Context, canceller context.CancelFunc) {
 				initOpcode = dp.Opcode()
 				_, file, mode := dp.ParseRRQ()
 				s.trace("op: %s | file: %s | mode: %s", dp.Opcode(), file, mode)
+
 				fp := filepath.Join(*Directory, file)
 				f, err := os.Open(fp)
 				if err != nil {
@@ -367,7 +368,7 @@ func (dp DataPacket) ParseRRQ() (oc Opcode, file, mode string) {
 		panic("FILE PARSE FAILED")
 	}
 
-	file = string(payload[0])
+	file = string(bytes.TrimSuffix(payload[0], []byte{0xFF}))
 	mode = string(payload[1])
 	return
 }
